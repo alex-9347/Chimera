@@ -1,0 +1,67 @@
+name: NEXUS-1 SF Distillation
+
+on:
+  workflow_dispatch:
+    inputs:
+      positions_per_worker:
+        description: 'Positionen pro Worker'
+        default: '400000'
+      sf_depth:
+        description: 'Stockfish Tiefe'
+        default: '10'
+
+jobs:
+  distill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        worker_id: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+                    20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install python-chess numpy
+
+      - name: Run worker
+        env:
+          WORKER_ID: ${{ matrix.worker_id }}
+          NUM_WORKERS: '40'
+          POSITIONS_PER_WORKER: ${{ github.event.inputs.positions_per_worker }}
+          SF_DEPTH: ${{ github.event.inputs.sf_depth }}
+        run: python worker.py
+
+      - name: Upload worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: distill-${{ matrix.worker_id }}
+          path: distill_out/
+          compression-level: 0
+          retention-days: 7
+
+  collect:
+    needs: distill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distill-*
+          path: all_distill/
+          merge-multiple: true
+      - name: Count and summarize
+        run: |
+          echo "Files:"; find all_distill -name '*.npz.gz' | wc -l
+          du -sh all_distill/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distill-combined
+          path: all_distill/
+          retention-days: 7
