@@ -1,11 +1,21 @@
 """
-NEXUS-1 Distillation Worker v2 — robust gegen Stockfish-Hänger und Timeout.
+NEXUS-1 / Chimera Distillation Worker v3.
+Läuft auf einem GitHub-Actions-Runner. Sampelt einen disjunkten Bereich
+der Lichess-PGN, bewertet mit Stockfish depth=10 (MultiPV=5), speichert
+FEN + Top-5-Indizes + Top-5-Gewichte + SF-Eval als .npz.gz.
+
+v3-Fixes:
+- save_checkpoint nutzt BytesIO + gzip.open (verhindert .npz.gz.npz)
+- Timeout für Stockfish-popen_uci (30s)
+- Heartbeat alle 30s
+- Checkpoint alle 50k Positionen
 """
-import os, sys, io, time, random, zipfile, urllib.request, gzip, json, signal
+import os, sys, io, time, random, zipfile, urllib.request, gzip, json, signal, tarfile
 import numpy as np
 import chess, chess.engine, chess.pgn
 from pathlib import Path
 
+# ── Config ─────────────────────────────────────────────────────────────────
 WORKER_ID = int(os.environ.get("WORKER_ID", "0"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "40"))
 POSITIONS_PER_WORKER = int(os.environ.get("POSITIONS_PER_WORKER", "400000"))
@@ -34,11 +44,10 @@ def ensure_stockfish():
     url = ("https://github.com/official-stockfish/Stockfish/releases/"
            "download/sf_16.1/stockfish-ubuntu-x86-64-avx2.tar")
     tp = Path("/tmp/stockfish.tar")
-    log(f"Downloading Stockfish...")
+    log("Downloading Stockfish...")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as r, open(tp, "wb") as f:
         while c := r.read(1 << 20): f.write(c)
-    import tarfile
     with tarfile.open(tp, "r") as tf:
         for m in tf.getmembers():
             if m.isfile():
@@ -53,22 +62,20 @@ def ensure_stockfish():
     return exe
 
 def popen_uci_with_timeout(exe, timeout=30):
-    """Wraps popen_uci in a signal-based timeout."""
     def _timeout_handler(signum, frame):
         raise SfTimeout(f"Stockfish did not respond in {timeout}s")
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    old = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout)
     try:
-        engine = chess.engine.SimpleEngine.popen_uci(str(exe))
-        return engine
+        return chess.engine.SimpleEngine.popen_uci(str(exe))
     finally:
         signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        signal.signal(signal.SIGALRM, old)
 
-SF_PATH = ensure_stockfish()
 log(f"Worker {WORKER_ID}/{NUM_WORKERS} | target={POSITIONS_PER_WORKER} pos | "
     f"depth={SF_DEPTH} multipv={SF_MULTIPV} threads={SF_THREADS}")
 
+SF_PATH = ensure_stockfish()
 try:
     engine = popen_uci_with_timeout(SF_PATH, timeout=30)
     log("Stockfish initialized")
@@ -101,12 +108,14 @@ def download_lichess():
 PGN_ZIP = download_lichess()
 log(f"PGN ready: {PGN_ZIP.stat().st_size/1e6:.0f} MB")
 
+# ── Move-Encoding ──────────────────────────────────────────────────────────
 def encode_move(move, turn):
     fs = move.from_square ^ 56 if turn == chess.BLACK else move.from_square
     ts = move.to_square ^ 56 if turn == chess.BLACK else move.to_square
     promo = 0 if move.promotion is None else move.promotion - 1
     return fs * 320 + ts * 5 + promo
 
+# ── SF-Bewertung ───────────────────────────────────────────────────────────
 def sf_eval_board(board):
     try:
         infos = engine.analyse(board, chess.engine.Limit(depth=SF_DEPTH),
@@ -130,17 +139,28 @@ def sf_eval_board(board):
     while len(idx) < SF_MULTIPV: idx.append(0); w = np.append(w, 0.0)
     return idx[:SF_MULTIPV], w[:SF_MULTIPV].tolist(), float(cps[0])
 
-# ── Checkpointing ──────────────────────────────────────────────────────────
+# ── Checkpoint (v3-Fix: BytesIO + gzip.open) ───────────────────────────────
 def save_checkpoint(fens, top_idx, top_w, vals, positions_done, final=False):
     suffix = "final" if final else f"part{positions_done:07d}"
     out = OUT_DIR / f"distill_{WORKER_ID:02d}_{suffix}.npz.gz"
+
+    # np.savez_compressed hängt bei Nicht-.npz-Endung automatisch .npz an.
+    # Bei ".npz.gz" würde "file.npz.gz.npz" entstehen. Deshalb: erst in BytesIO
+    # schreiben, dann mit gzip.open auf den finalen Pfad.
+    buf = io.BytesIO()
     np.savez_compressed(
-        out,
+        buf,
         fens=np.array(fens, dtype=object),
         top_idx=np.array(top_idx, dtype=np.int32),
         top_w=np.array(top_w, dtype=np.float32),
         val_cp=np.array(vals, dtype=np.float32),
     )
+    buf.seek(0)
+    with gzip.open(out, "wb", compresslevel=6) as f_out:
+        f_out.write(buf.read())
+
+    if not out.exists():
+        raise FileNotFoundError(f"Checkpoint save failed: {out}")
     log(f"💾 Saved: {out.name} ({out.stat().st_size/1e6:.1f} MB, {positions_done} pos)")
     return out
 
@@ -168,7 +188,8 @@ with zipfile.ZipFile(PGN_ZIP, "r") as zf:
             if time.time() - last_heartbeat > 30:
                 el = time.time() - t_start
                 rate = positions_done / max(el, 1)
-                log(f"  ❤ game_i={game_i} games={games_seen} pos={positions_done}/{POSITIONS_PER_WORKER} "
+                log(f"  ❤ game_i={game_i} games={games_seen} "
+                    f"pos={positions_done}/{POSITIONS_PER_WORKER} "
                     f"({rate:.0f}/s, {el/60:.1f}min)")
                 last_heartbeat = time.time()
 
@@ -184,11 +205,11 @@ with zipfile.ZipFile(PGN_ZIP, "r") as zf:
                 if i in sample and positions_done < POSITIONS_PER_WORKER:
                     res = sf_eval_board(b)
                     if res is not None:
-                        fen = b.fen()
-                        fi, fw, fv = res
-                        fens.append(fen); top_idx.append(fi); top_w.append(fw); vals.append(fv)
+                        fens.append(b.fen())
+                        top_idx.append(res[0])
+                        top_w.append(res[1])
+                        vals.append(res[2])
                         positions_done += 1
-                        # Checkpoint alle N Positionen
                         if positions_done - last_ckpt_pos >= CHECKPOINT_EVERY:
                             save_checkpoint(fens, top_idx, top_w, vals, positions_done)
                             last_ckpt_pos = positions_done
