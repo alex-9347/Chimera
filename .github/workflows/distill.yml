@@ -39,6 +39,7 @@ jobs:
         run: python worker.py
 
       - name: Upload worker artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: distill-${{ matrix.worker_id }}
@@ -48,6 +49,7 @@ jobs:
 
   collect:
     needs: distill
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
